@@ -30,6 +30,41 @@ no matcher for this one — so there is no recovery path and no prompt.
 
 Refreshing runs `aws sso login --profile <profile>`, which opens your browser.
 
+## Seeing the device code
+
+AWS's authorization page asks you to confirm the code shown there matches *"the
+one given to you"*:
+
+```
+  Confirm this code matches the one given to you.
+              XTKT-QMTH
+```
+
+Nothing gives it to you if the login is run through `pi.exec`, which buffers the
+child process's output until it exits — the code would arrive ~180 seconds late,
+after the decision was already made. So the login is **spawned and streamed**
+instead, and the code is surfaced the moment the CLI prints it (measured at
+~370ms, against a login that resolves in minutes):
+
+```
+AWS SSO login
+  profile   ai-dev   tenant   d-c3671a531d.awsapps.com
+  code      MRTD-RPRR
+  this must match the code shown in your browser — cancel there if not
+```
+
+The code appears in a widget above the editor, in the footer, and as a `warning`
+notification that stays in scrollback. The profile and tenant host are shown
+alongside it, so you can confirm *which* login is being requested, not just that
+some login is. If the codes differ, cancel in the browser — someone else's device
+authorization is in flight.
+
+pi passes `--no-browser` so the CLI prints the code *instead of* racing ahead to
+the browser; the extension then opens the autofill URL itself, so you still don't
+have to type the code. On an AWS CLI too old for `--no-browser`, it retries with
+the browser-opening form and streams the code as soon as it appears. Set
+`PI_AWS_SSO_NO_OPEN=1` to never open a browser automatically.
+
 Design notes:
 
 - **The pre-flight check is a local file read**, not `aws sts get-caller-identity`.
@@ -45,11 +80,10 @@ Design notes:
   prompt and a single login.
 - **Headless runs fail loudly** instead of blocking on a browser flow that cannot
   succeed.
-
 ## Install
 
 ```bash
-pi install git:github.com/javrasya/pi-aws-sso-refresh@v0.1.0
+pi install git:github.com/javrasya/pi-aws-sso-refresh@v0.2.0
 ```
 
 Or try it for a single run without installing:
@@ -61,7 +95,7 @@ pi -e git:github.com/javrasya/pi-aws-sso-refresh
 Project-local install (writes to `.pi/settings.json`, shareable with your team):
 
 ```bash
-pi install -l git:github.com/javrasya/pi-aws-sso-refresh@v0.1.0
+pi install -l git:github.com/javrasya/pi-aws-sso-refresh@v0.2.0
 ```
 
 Remove with:
@@ -87,6 +121,12 @@ the top of `extensions/aws-sso-refresh.ts` are worth knowing about:
 | `EXPIRY_SKEW_MS` | 5 min | Refresh when the token expires within this window. |
 | `LOGIN_TIMEOUT_MS` | 180 s | How long to wait for the browser login. |
 
+One environment variable is honoured:
+
+| Variable | Effect |
+|----------|--------|
+| `PI_AWS_SSO_NO_OPEN=1` | Never open a browser automatically; show the code and URL only. |
+
 ## Development
 
 ```bash
@@ -96,7 +136,10 @@ npm run typecheck
 ```
 
 The tests point `$HOME` at a temporary fixture directory, so they never read your
-real `~/.aws` and never shell out to `aws`.
+real `~/.aws` and never shell out to `aws`. The device-code tests assert against
+verbatim `aws-cli/2.34.38` output and check what was on screen *while the login
+was still running*, since "the code was displayed eventually" is not the property
+that matters.
 
 ## License
 

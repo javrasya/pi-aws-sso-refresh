@@ -41,8 +41,28 @@ const {
   resolveBedrockProfile,
   formatRelative,
   isSsoExpiredError,
+  parseSsoPrompt,
+  deps,
 } = mod;
 const createExtension = mod.default;
+
+/**
+ * Verbatim `aws sso login --profile <p> --no-browser` output, captured from
+ * aws-cli/2.34.38. The device code arrives on stdout ~375ms in, roughly 180s
+ * before the process exits, which is what makes streaming it worthwhile.
+ */
+const REAL_CLI_OUTPUT = `Browser will not be automatically opened.
+Please visit the following URL:
+
+https://d-c3671a531d.awsapps.com/start/#/device
+
+Then enter the code:
+
+CLJH-CFGF
+
+Alternatively, you may visit the following URL which will autofill the code upon loading:
+https://d-c3671a531d.awsapps.com/start/#/device?user_code=CLJH-CFGF
+`;
 
 before(() => {
   writeAwsConfig(`
@@ -216,26 +236,82 @@ describe("formatRelative", () => {
 
 // --------------------------------------------------------------- wiring
 
+type SpawnScript = {
+  /** Chunks emitted on stdout before exit, in order. */
+  chunks?: string[];
+  stderrChunks?: string[];
+  /** Exit code; null simulates a process that never exits (timeout path). */
+  code?: number | null;
+  /** Throw from spawn(), e.g. aws not on PATH. */
+  spawnError?: Error;
+};
+
 type Harness = {
   hook: (name: string) => (event: unknown, ctx: unknown) => Promise<unknown>;
   hookNames: () => string[];
   command: (name: string) => (args: string, ctx: unknown) => Promise<void>;
   commandNames: () => string[];
-  execCalls: unknown[][];
-  notices: string[];
+  /** Args of each spawn("aws", [...]) call. */
+  spawnArgs: string[][];
+  openedUrls: string[];
+  notices: { message: string; level: string }[];
+  widgets: (string[] | undefined)[];
+  statuses: (string | undefined)[];
+  /** Widget/status/notify state observed *while* the login was still running. */
+  duringLogin: () => { widgets: (string[] | undefined)[]; notices: string[] };
   ctx: (provider: string, opts?: { confirm?: boolean; hasUI?: boolean }) => unknown;
-  setExecResult: (result: { code: number; stdout?: string; stderr?: string }) => void;
+  script: (script: SpawnScript | SpawnScript[]) => void;
 };
 
 function harness(): Harness {
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
-  const execCalls: unknown[][] = [];
-  const notices: string[] = [];
-  let execResult: { code: number; stdout: string; stderr: string } = {
-    code: 0,
-    stdout: "",
-    stderr: "",
+  const spawnArgs: string[][] = [];
+  const openedUrls: string[] = [];
+  const notices: { message: string; level: string }[] = [];
+  const widgets: (string[] | undefined)[] = [];
+  const statuses: (string | undefined)[] = [];
+  let scripts: SpawnScript[] = [{ chunks: [REAL_CLI_OUTPUT], code: 0 }];
+  let snapshot: { widgets: (string[] | undefined)[]; notices: string[] } = {
+    widgets: [],
+    notices: [],
+  };
+
+  deps.spawn = (command: string, args: string[]) => {
+    assert.equal(command, "aws");
+    spawnArgs.push(args);
+    const script = scripts[Math.min(spawnArgs.length - 1, scripts.length - 1)] ?? {};
+    if (script.spawnError) throw script.spawnError;
+
+    const listeners = new Map<string, ((...a: never[]) => void)[]>();
+    const on = (event: string, listener: (...a: never[]) => void) => {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+    };
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const listener of listeners.get(event) ?? []) {
+        (listener as (...a: unknown[]) => void)(...args);
+      }
+    };
+
+    // Emit asynchronously, like a real child process: the login promise must
+    // already be awaiting when the code arrives.
+    setTimeout(() => {
+      for (const chunk of script.chunks ?? []) emit("stdout", Buffer.from(chunk));
+      for (const chunk of script.stderrChunks ?? []) emit("stderr", Buffer.from(chunk));
+      // Capture what the user could see while the login was still in flight.
+      snapshot = { widgets: [...widgets], notices: notices.map((n) => n.message) };
+      if (script.code !== null) emit("exit", script.code ?? 0, null);
+    }, 1);
+
+    return {
+      stdout: { on: (_e: "data", listener: (chunk: unknown) => void) => on("stdout", listener as never) },
+      stderr: { on: (_e: "data", listener: (chunk: unknown) => void) => on("stderr", listener as never) },
+      on: on as never,
+      kill: () => emit("exit", null, "SIGTERM"),
+    };
+  };
+  deps.openUrl = (url: string) => {
+    openedUrls.push(url);
   };
 
   const pi = {
@@ -244,10 +320,6 @@ function harness(): Harness {
     },
     registerCommand: (name: string, options: never) => {
       commands.set(name, options);
-    },
-    exec: async (...args: unknown[]) => {
-      execCalls.push(args);
-      return { killed: false, ...execResult };
     },
   };
   // biome-ignore lint/suspicious/noExplicitAny: test double for ExtensionAPI
@@ -266,23 +338,33 @@ function harness(): Harness {
       return command.handler;
     },
     commandNames: () => [...commands.keys()],
-    execCalls,
+    spawnArgs,
+    openedUrls,
     notices,
-    setExecResult: (result) => {
-      execResult = { stdout: "", stderr: "", ...result };
+    widgets,
+    statuses,
+    duringLogin: () => snapshot,
+    script: (script) => {
+      scripts = Array.isArray(script) ? script : [script];
     },
     ctx: (provider, opts = {}) => ({
       hasUI: opts.hasUI ?? true,
       model: { provider, id: "test-model" },
       ui: {
-        notify: (message: string) => notices.push(message),
-        setStatus: () => {},
+        notify: (message: string, level: string) => notices.push({ message, level }),
+        setStatus: (_id: string, text?: string) => statuses.push(text),
+        setWidget: (_id: string, lines?: string[]) => widgets.push(lines),
         confirm: async () => opts.confirm ?? true,
         select: async () => undefined,
         input: async () => undefined,
       },
     }),
   };
+}
+
+/** Every message notified so far, joined for loose matching. */
+function messages(h: Harness): string {
+  return h.notices.map((n) => n.message).join("\n");
 }
 
 function assistantError(errorMessage: string, provider = "amazon-bedrock") {
@@ -311,10 +393,7 @@ describe("extension wiring", () => {
     assert.match(result.message.errorMessage, /^AWS SSO session expired for profile "sso-modern"/);
     assert.match(result.message.errorMessage, /Original error: The SSO session/);
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.deepEqual(h.execCalls[0]?.slice(0, 2), [
-      "aws",
-      ["sso", "login", "--profile", "sso-modern"],
-    ]);
+    assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
   });
 
   it("leaves unrelated errors and other providers untouched", async () => {
@@ -341,19 +420,19 @@ describe("extension wiring", () => {
       ),
       undefined,
     );
-    assert.equal(h.execCalls.length, 0);
+    assert.equal(h.spawnArgs.length, 0);
   });
 
   it("reports a failed login instead of claiming success", async () => {
     process.env.AWS_PROFILE = "sso-modern";
     const h = harness();
-    h.setExecResult({ code: 1, stderr: "Error loading SSO Token" });
+    h.script({ stderrChunks: ["Error loading SSO Token"], code: 1 });
     await h.hook("message_end")(
       assistantError("Token has expired and refresh failed"),
       h.ctx("amazon-bedrock"),
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.ok(h.notices.some((n) => /aws sso login failed \(exit 1\).*Error loading SSO Token/.test(n)));
+    assert.match(messages(h), /aws sso login failed \(exit 1\).*Error loading SSO Token/);
   });
 
   it("does not attempt a browser login without a UI", async () => {
@@ -364,8 +443,8 @@ describe("extension wiring", () => {
       h.ctx("amazon-bedrock", { hasUI: false }),
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(h.execCalls.length, 0);
-    assert.ok(h.notices.some((n) => /Run 'aws sso login --profile sso-modern' and retry/.test(n)));
+    assert.equal(h.spawnArgs.length, 0);
+    assert.match(messages(h), /Run 'aws sso login --profile sso-modern' and retry/);
   });
 
   it("stops prompting for a profile once the user declines", async () => {
@@ -375,7 +454,7 @@ describe("extension wiring", () => {
     const ctx = h.ctx("amazon-bedrock", { confirm: false });
     await h.hook("before_agent_start")({ prompt: "hi" }, ctx);
     await h.hook("before_agent_start")({ prompt: "hi" }, ctx);
-    assert.equal(h.execCalls.length, 0);
+    assert.equal(h.spawnArgs.length, 0);
   });
 });
 
@@ -386,7 +465,7 @@ describe("before_agent_start pre-flight", () => {
     process.env.AWS_PROFILE = "sso-modern";
     const missing = harness();
     await missing.hook("before_agent_start")({ prompt: "hi" }, missing.ctx("amazon-bedrock"));
-    assert.equal(missing.execCalls.length, 1);
+    assert.equal(missing.spawnArgs.length, 1);
 
     writeSsoCache("soon", {
       startUrl: START_URL,
@@ -395,7 +474,7 @@ describe("before_agent_start pre-flight", () => {
     });
     const soon = harness();
     await soon.hook("before_agent_start")({ prompt: "hi" }, soon.ctx("amazon-bedrock"));
-    assert.equal(soon.execCalls.length, 1);
+    assert.equal(soon.spawnArgs.length, 1);
   });
 
   it("stays quiet for a healthy token, another provider, or a non-SSO profile", async () => {
@@ -413,8 +492,9 @@ describe("before_agent_start pre-flight", () => {
     process.env.AWS_PROFILE = "static-keys";
     await h.hook("before_agent_start")({ prompt: "hi" }, h.ctx("amazon-bedrock"));
 
-    assert.equal(h.execCalls.length, 0);
+    assert.equal(h.spawnArgs.length, 0);
     assert.deepEqual(h.notices, []);
+    assert.deepEqual(h.widgets, []);
   });
 
   it("collapses concurrent refreshes into one login", async () => {
@@ -425,7 +505,7 @@ describe("before_agent_start pre-flight", () => {
       h.hook("before_agent_start")({ prompt: "b" }, h.ctx("amazon-bedrock")),
       h.hook("before_agent_start")({ prompt: "c" }, h.ctx("amazon-bedrock")),
     ]);
-    assert.equal(h.execCalls.length, 1);
+    assert.equal(h.spawnArgs.length, 1);
   });
 });
 
@@ -435,16 +515,130 @@ describe("/aws-sso command", () => {
   it("logs in without asking for confirmation", async () => {
     const h = harness();
     await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock", { confirm: false }));
-    assert.deepEqual(h.execCalls[0]?.slice(0, 2), [
-      "aws",
-      ["sso", "login", "--profile", "sso-modern"],
-    ]);
+    assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
   });
 
   it("refuses a non-SSO profile", async () => {
     const h = harness();
     await h.command("aws-sso")("static-keys", h.ctx("amazon-bedrock"));
-    assert.equal(h.execCalls.length, 0);
-    assert.ok(h.notices.some((n) => /is not SSO-based/.test(n)));
+    assert.equal(h.spawnArgs.length, 0);
+    assert.match(messages(h), /is not SSO-based/);
+  });
+});
+
+describe("parseSsoPrompt", () => {
+  it("extracts the code and prefers the autofill URL from real CLI output", () => {
+    assert.deepEqual(parseSsoPrompt(REAL_CLI_OUTPUT), {
+      code: "CLJH-CFGF",
+      url: "https://d-c3671a531d.awsapps.com/start/#/device?user_code=CLJH-CFGF",
+    });
+  });
+
+  it("handles a chunk that arrives before the code is printed", () => {
+    const partial = "Browser will not be automatically opened.\nPlease visit the following URL:\n";
+    assert.deepEqual(parseSsoPrompt(partial), {});
+  });
+
+  it("falls back to a plain URL when no autofill variant is offered", () => {
+    const output = "open https://device.sso.eu-west-1.amazonaws.com/\nThen enter: ABCD-1234\n";
+    assert.deepEqual(parseSsoPrompt(output), {
+      code: "ABCD-1234",
+      url: "https://device.sso.eu-west-1.amazonaws.com/",
+    });
+  });
+
+  it("does not mistake lowercase host fragments for a code", () => {
+    assert.equal(parseSsoPrompt("https://d-c3671a531d.awsapps.com/start").code, undefined);
+  });
+});
+
+describe("device code visibility", () => {
+  beforeEach(clearSsoCache);
+
+  it("shows the code in a widget, the footer, and a notice before login finishes", async () => {
+    process.env.AWS_PROFILE = "sso-modern";
+    const h = harness();
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+
+    // What the user could actually see while the browser was waiting.
+    const during = h.duringLogin();
+    const widgetText = during.widgets.map((lines) => (lines ?? []).join(" | "));
+    assert.ok(
+      widgetText.some((text) => text.includes("CLJH-CFGF")),
+      `code never reached a widget during login: ${JSON.stringify(widgetText)}`,
+    );
+    assert.ok(
+      during.notices.some((n) => n.includes("CLJH-CFGF")),
+      "code never reached a notification during login",
+    );
+
+    // Identity context: which profile and which tenant is asking.
+    const codeWidget = during.widgets.find((lines) => (lines ?? []).join(" ").includes("CLJH-CFGF"));
+    const codeWidgetText = (codeWidget ?? []).join(" ");
+    assert.match(codeWidgetText, /sso-modern/);
+    assert.match(codeWidgetText, /example\.awsapps\.com/);
+    assert.match(codeWidgetText, /match the code shown in your browser/);
+
+    // The code notice is a security check, so it must not be a quiet "info".
+    const codeNotice = h.notices.find((n) => n.message.includes("CLJH-CFGF"));
+    assert.equal(codeNotice?.level, "warning");
+
+    assert.match(messages(h), /Confirm it matches the code in your browser/);
+    assert.equal(h.statuses.some((s) => s?.includes("CLJH-CFGF")), true);
+  });
+
+  it("opens the autofill URL so the code does not have to be retyped", async () => {
+    const h = harness();
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [
+      "https://d-c3671a531d.awsapps.com/start/#/device?user_code=CLJH-CFGF",
+    ]);
+  });
+
+  it("clears the widget and status when the login ends", async () => {
+    const h = harness();
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.equal(h.widgets.at(-1), undefined);
+    assert.equal(h.statuses.at(-1), undefined);
+  });
+
+  it("streams the code even when the CLI writes it to stderr", async () => {
+    const h = harness();
+    h.script({ stderrChunks: [REAL_CLI_OUTPUT], code: 0 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.ok(h.duringLogin().notices.some((n) => n.includes("CLJH-CFGF")));
+  });
+
+  it("shows the code once when output arrives in fragments", async () => {
+    const h = harness();
+    h.script({ chunks: ["Then enter the code:\n\nCLJH", "-CFGF\n\nmore output\n"], code: 0 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.equal(h.notices.filter((n) => n.message.includes("CLJH-CFGF")).length, 1);
+  });
+
+  it("falls back to the browser-opening form on an AWS CLI without --no-browser", async () => {
+    const h = harness();
+    h.script([
+      { stderrChunks: ["Unknown options: --no-browser\nusage: aws sso login\n"], code: 2 },
+      { chunks: [REAL_CLI_OUTPUT], code: 0 },
+    ]);
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+
+    assert.deepEqual(h.spawnArgs, [
+      ["sso", "login", "--profile", "sso-modern", "--no-browser"],
+      ["sso", "login", "--profile", "sso-modern"],
+    ]);
+    // The retry lets the CLI open the browser, so we must not open a second tab.
+    assert.deepEqual(h.openedUrls, []);
+    assert.match(messages(h), /refreshed for profile "sso-modern"/);
+    // The unsupported-flag probe must not be reported as a real failure.
+    assert.doesNotMatch(messages(h), /Unknown options/);
+  });
+
+  it("reports a missing aws CLI instead of hanging", async () => {
+    const h = harness();
+    h.script({ spawnError: Object.assign(new Error("spawn aws ENOENT"), { code: "ENOENT" }) });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.match(messages(h), /Could not run 'aws sso login --profile sso-modern': spawn aws ENOENT/);
   });
 });

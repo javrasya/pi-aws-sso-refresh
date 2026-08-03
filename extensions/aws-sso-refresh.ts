@@ -18,6 +18,7 @@
  * Refreshing runs `aws sso login --profile <profile>`, which opens a browser.
  */
 
+import { spawn as nodeSpawn } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +31,17 @@ const EXPIRY_SKEW_MS = 5 * 60 * 1000;
 
 /** `aws sso login` blocks on a browser round trip. */
 const LOGIN_TIMEOUT_MS = 180_000;
+
+/** AWS device codes are two groups of four uppercase alphanumerics. */
+const DEVICE_CODE_PATTERN = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
+
+/** The autofill form of the portal URL carries the code as a query param. */
+const AUTOFILL_URL_PATTERN = /(https?:\/\/\S*[?&]user_code=[A-Z0-9]{4}-[A-Z0-9]{4})/;
+const ANY_URL_PATTERN = /(https?:\/\/\S+)/;
+
+/** Older AWS CLI builds predate `--no-browser`. */
+const UNSUPPORTED_FLAG_PATTERN =
+  /(?:unknown option|unrecognized argument|invalid choice|argument (?:operation|subcommand))/i;
 
 const SSO_EXPIRED_PATTERN =
   /SSO session associated with this profile has expired|Token (?:has expired|is expired) and refresh failed|The security token included in the request is (?:expired|invalid)/i;
@@ -176,6 +188,94 @@ export function isSsoExpiredError(message: string): boolean {
   return SSO_EXPIRED_PATTERN.test(message);
 }
 
+// ------------------------------------------------------- login subprocess
+
+/**
+ * The device code and portal URL from `aws sso login --no-browser` output.
+ *
+ * The browser's authorization page asks the user to confirm that the code shown
+ * there matches "the one given to you" — so the code has to reach the user
+ * *before* the login completes, which is why the login is streamed rather than
+ * run through `pi.exec` (which buffers until exit).
+ */
+export function parseSsoPrompt(output: string): { code?: string; url?: string } {
+  const code = output.match(DEVICE_CODE_PATTERN)?.[1];
+  // Prefer the autofill URL: it carries the code, so the user does not retype it.
+  const url = output.match(AUTOFILL_URL_PATTERN)?.[1] ?? output.match(ANY_URL_PATTERN)?.[1];
+  return { ...(code !== undefined && { code }), ...(url !== undefined && { url }) };
+}
+
+type ChunkStream = { on(event: "data", listener: (chunk: unknown) => void): unknown } | null;
+
+export type SpawnedChild = {
+  stdout: ChunkStream;
+  stderr: ChunkStream;
+  on(event: "exit", listener: (code: number | null, signal: string | null) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  kill(signal?: NodeJS.Signals): unknown;
+};
+
+function defaultOpenUrl(url: string): void {
+  if (process.env.PI_AWS_SSO_NO_OPEN === "1") return;
+  const [command, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  try {
+    const child = nodeSpawn(command, args, { stdio: "ignore", detached: true });
+    child.on("error", () => {}); // The URL is displayed anyway; opening is best-effort.
+    child.unref();
+  } catch {
+    // Same: the user can still click or paste the URL.
+  }
+}
+
+/** Injection seam for tests, which must not shell out or open a browser. */
+export const deps = {
+  spawn: (command: string, args: string[]): SpawnedChild =>
+    nodeSpawn(command, args, { stdio: ["ignore", "pipe", "pipe"] }),
+  openUrl: defaultOpenUrl,
+};
+
+/** Portal host, so the user can confirm the login targets the expected tenant. */
+function tenantOf(startUrl: string | undefined): string | undefined {
+  if (!startUrl) return undefined;
+  try {
+    return new URL(startUrl).host;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Keeps the device code on screen for the whole login, next to the profile and
+ * tenant it belongs to, so the user can match it against the browser's
+ * "Confirm this code matches the one given to you" page and cancel if it differs.
+ */
+function renderLoginWidget(
+  ctx: ExtensionContext,
+  profile: string,
+  tenant: string | undefined,
+  code: string | undefined,
+): void {
+  const accent = (text: string) => ctx.ui.theme?.fg?.("accent", text) ?? text;
+  const dim = (text: string) => ctx.ui.theme?.fg?.("dim", text) ?? text;
+
+  const lines = [
+    accent("AWS SSO login"),
+    dim(`  profile   ${profile}${tenant ? `   tenant   ${tenant}` : ""}`),
+    code === undefined
+      ? dim("  requesting device code...")
+      : `  code      ${accent(code)}`,
+  ];
+  if (code !== undefined) {
+    lines.push(dim("  this must match the code shown in your browser — cancel there if not"));
+  }
+  ctx.ui.setWidget("aws-sso", lines);
+}
+
 // -------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
@@ -185,37 +285,109 @@ export default function (pi: ExtensionAPI) {
   const declined = new Set<string>();
 
   async function runLogin(profile: string, ctx: ExtensionContext): Promise<boolean> {
-    ctx.ui.setStatus("aws-sso", `aws sso login (${profile})...`);
-    try {
-      const result = await pi.exec("aws", ["sso", "login", "--profile", profile], {
-        timeout: LOGIN_TIMEOUT_MS,
-      });
-      if (result.code === 0) {
-        ctx.ui.notify(`AWS SSO session refreshed for profile "${profile}".`, "info");
-        return true;
-      }
-      // Output is buffered until exit, so surface the tail rather than swallow it.
-      const detail = (result.stderr || result.stdout || "")
-        .trim()
-        .split("\n")
-        .slice(-3)
-        .join(" ");
-      ctx.ui.notify(
-        `aws sso login failed (exit ${result.code})${detail ? `: ${detail}` : ""}. ` +
-          `Run 'aws sso login --profile ${profile}' manually.`,
-        "error",
-      );
-      return false;
-    } catch (error) {
-      ctx.ui.notify(
-        `Could not run 'aws sso login --profile ${profile}': ` +
-          `${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-      return false;
-    } finally {
-      ctx.ui.setStatus("aws-sso", "");
+    const tenant = tenantOf(resolveSsoStartUrl(profile));
+
+    // --no-browser makes the CLI print the code and URL instead of racing ahead
+    // to the browser, so we can show the code first and open the URL after.
+    const attempt = await streamLogin(profile, tenant, ctx, true);
+    if (attempt.unsupportedFlag) {
+      // Older CLI: let it open the browser itself. The code is still streamed,
+      // just possibly after the browser is already up.
+      return (await streamLogin(profile, tenant, ctx, false)).ok;
     }
+    return attempt.ok;
+  }
+
+  async function streamLogin(
+    profile: string,
+    tenant: string | undefined,
+    ctx: ExtensionContext,
+    noBrowser: boolean,
+  ): Promise<{ ok: boolean; unsupportedFlag?: boolean }> {
+    const args = ["sso", "login", "--profile", profile];
+    if (noBrowser) args.push("--no-browser");
+
+    ctx.ui.setStatus("aws-sso", `aws sso login (${profile})...`);
+    renderLoginWidget(ctx, profile, tenant, undefined);
+
+    let output = "";
+    let shownCode: string | undefined;
+
+    const result = await new Promise<{ code: number | null; spawnError?: Error }>((resolve) => {
+      let child: SpawnedChild;
+      try {
+        child = deps.spawn("aws", args);
+      } catch (error) {
+        resolve({ code: null, spawnError: error as Error });
+        return;
+      }
+
+      let settled = false;
+      const finish = (value: { code: number | null; spawnError?: Error }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish({ code: null });
+      }, LOGIN_TIMEOUT_MS);
+      // Never hold the process open on this timer.
+      (timer as unknown as { unref?: () => void }).unref?.();
+
+      const onChunk = (chunk: unknown) => {
+        output += String(chunk);
+        const { code, url } = parseSsoPrompt(output);
+        if (code === undefined || code === shownCode) return;
+
+        // Surface the code the moment it appears. This is the whole point: the
+        // browser asks the user to confirm it matches "the one given to you".
+        shownCode = code;
+        renderLoginWidget(ctx, profile, tenant, code);
+        ctx.ui.setStatus("aws-sso", `aws sso ${code}`);
+        ctx.ui.notify(
+          `AWS SSO code ${code} for profile "${profile}"${tenant ? ` (${tenant})` : ""}. ` +
+            `Confirm it matches the code in your browser; cancel there if it does not.`,
+          "warning",
+        );
+        if (noBrowser && url) deps.openUrl(url);
+      };
+
+      child.stdout?.on("data", onChunk);
+      child.stderr?.on("data", onChunk);
+      child.on("error", (error) => finish({ code: null, spawnError: error }));
+      child.on("exit", (code) => finish({ code }));
+    });
+
+    ctx.ui.setWidget("aws-sso", undefined);
+    ctx.ui.setStatus("aws-sso", undefined);
+
+    if (result.spawnError) {
+      ctx.ui.notify(
+        `Could not run 'aws sso login --profile ${profile}': ${result.spawnError.message}`,
+        "error",
+      );
+      return { ok: false };
+    }
+
+    if (result.code === 0) {
+      ctx.ui.notify(`AWS SSO session refreshed for profile "${profile}".`, "info");
+      return { ok: true };
+    }
+
+    if (noBrowser && UNSUPPORTED_FLAG_PATTERN.test(output) && output.includes("no-browser")) {
+      return { ok: false, unsupportedFlag: true };
+    }
+
+    const detail = output.trim().split("\n").slice(-3).join(" ");
+    ctx.ui.notify(
+      `aws sso login ${result.code === null ? "timed out" : `failed (exit ${result.code})`}` +
+        `${detail ? `: ${detail}` : ""}. Run 'aws sso login --profile ${profile}' manually.`,
+      "error",
+    );
+    return { ok: false };
   }
 
   async function refresh(
@@ -340,6 +512,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    ctx.ui.setStatus("aws-sso", "");
+    ctx.ui.setStatus("aws-sso", undefined);
+    ctx.ui.setWidget("aws-sso", undefined);
   });
 }
