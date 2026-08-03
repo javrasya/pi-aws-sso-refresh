@@ -1,0 +1,40 @@
+{
+  "name": "pi-aws-sso-refresh",
+  "version": "0.1.0",
+  "description": "Auto-refresh expired AWS SSO sessions for pi's Amazon Bedrock provider",
+  "license": "MIT",
+  "author": "javrasya",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/javrasya/pi-aws-sso-refresh.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "aws",
+    "sso",
+    "bedrock"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "test": "tsx --test test/*.test.mts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "files": [
+    "extensions",
+    "README.md"
+  ]
+}
