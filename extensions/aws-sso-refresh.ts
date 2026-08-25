@@ -1,11 +1,12 @@
 /**
  * pi-aws-sso-refresh
  *
- * pi's Amazon Bedrock provider authenticates through the AWS SDK default
- * credential chain, so pi holds no credential of its own to refresh. When an SSO
- * session expires, the failure surfaces mid-stream as an opaque provider error
- * ("The SSO session associated with this profile has expired...") with no
- * `/login` affordance, because pi's re-auth prompt only covers OAuth providers.
+ * pi's built-in Amazon Bedrock provider authenticates through the AWS SDK default
+ * credential chain. Custom Bedrock Mantle providers can instead mint a short-lived
+ * bearer token from that same chain. In either case pi holds no renewable AWS SSO
+ * credential of its own. When the SSO session expires, the failure surfaces as an
+ * opaque provider/auth error with no `/login` affordance, because pi's re-auth
+ * prompt only covers OAuth providers.
  *
  * This extension closes that gap:
  *
@@ -156,14 +157,25 @@ export function cachedTokenExpiry(startUrl: string): number | undefined {
  * The profile pi will actually use for Bedrock, or undefined when this setup is
  * not SSO-based and we should stay out of the way.
  *
- * Mirrors the precedence in pi-ai's `bedrock-converse-stream`: a bearer token or
- * skip-auth proxy wins, otherwise `AWS_PROFILE` from the process environment or
- * from the env scoped to the active Bedrock provider's credential in auth.json.
- * Custom Mantle providers fall back to the built-in `amazon-bedrock` credential
- * so an existing `/login amazon-bedrock` setup keeps working.
+ * `PI_AWS_SSO_PROFILE` is an explicit contract between this pre-flight hook and
+ * custom credential commands (for example, a Mantle bearer-token minter). It wins
+ * over ambient `AWS_PROFILE`, which in turn wins over the profile scoped to the
+ * active provider's credential in auth.json. Custom Mantle providers fall back to
+ * the built-in `amazon-bedrock` credential so an existing `/login amazon-bedrock`
+ * setup keeps working.
  */
 export function isBedrockProvider(provider: string | undefined): boolean {
   return provider !== undefined && BEDROCK_PROVIDERS.has(provider);
+}
+
+export function configuredBedrockProfile(
+  provider = "amazon-bedrock",
+): string | undefined {
+  return firstNonEmpty(
+    process.env.PI_AWS_SSO_PROFILE,
+    process.env.AWS_PROFILE,
+    storedAuthProfile(provider),
+  );
 }
 
 export function resolveBedrockProfile(provider = "amazon-bedrock"): string | undefined {
@@ -171,10 +183,18 @@ export function resolveBedrockProfile(provider = "amazon-bedrock"): string | und
   if (process.env.AWS_BEDROCK_SKIP_AUTH === "1") return undefined;
 
   // No profile at all means static keys or a container/instance role, not SSO.
-  const profile = process.env.AWS_PROFILE ?? storedAuthProfile(provider);
+  const profile = configuredBedrockProfile(provider);
   if (!profile) return undefined;
 
   return resolveSsoStartUrl(profile) ? profile : undefined;
+}
+
+function firstNonEmpty(...values: (string | undefined)[]): string | undefined {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
 }
 
 function storedAuthProfile(provider: string): string | undefined {
@@ -485,7 +505,8 @@ export default function (pi: ExtensionAPI) {
     const errorMessage = message.errorMessage ?? "";
     if (!isSsoExpiredError(errorMessage)) return;
 
-    const profile = resolveBedrockProfile(provider) ?? process.env.AWS_PROFILE ?? "default";
+    const profile =
+      resolveBedrockProfile(provider) ?? configuredBedrockProfile(provider) ?? "default";
 
     // Fire and forget: message finalization must not block on a browser flow.
     void refresh(profile, ctx, {
@@ -516,7 +537,7 @@ export default function (pi: ExtensionAPI) {
       const profile =
         args.trim() ||
         resolveBedrockProfile(provider) ||
-        process.env.AWS_PROFILE ||
+        configuredBedrockProfile(provider) ||
         "default";
       const startUrl = resolveSsoStartUrl(profile);
       if (!startUrl) {

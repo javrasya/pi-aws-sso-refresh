@@ -34,6 +34,12 @@ The extension recognizes pi's built-in `amazon-bedrock` provider and the custom
 `bedrock-mantle`, `bedrock-mantle-openai`, and `bedrock-mantle-anthropic`
 providers.
 
+Mantle uses different endpoints and APIs from pi's built-in Bedrock Converse
+provider. This package does **not** provide that transport: configure a custom
+provider in `models.json` using pi's existing `openai-responses` or
+`anthropic-messages` API, or install a separate Mantle provider package. This
+package only keeps the AWS SSO credentials used by that provider healthy.
+
 ## Seeing the device code
 
 AWS's authorization page asks you to confirm the code shown there matches *"the
@@ -112,8 +118,8 @@ pi remove git:github.com/javrasya/pi-aws-sso-refresh
 
 - The AWS CLI v2 (`aws`) on `PATH`.
 - A profile in `~/.aws/config` configured for IAM Identity Center (SSO), selected
-  via `AWS_PROFILE` or stored on the active Bedrock provider's credential in
-  `~/.pi/agent/auth.json`. Mantle providers also fall back to the
+  via `PI_AWS_SSO_PROFILE`, `AWS_PROFILE`, or the active Bedrock provider's
+  credential in `~/.pi/agent/auth.json`. Mantle providers also fall back to the
   `amazon-bedrock` credential (`/login amazon-bedrock` → "AWS profile").
 
 ## Configuration
@@ -126,11 +132,20 @@ the top of `extensions/aws-sso-refresh.ts` are worth knowing about:
 | `EXPIRY_SKEW_MS` | 5 min | Refresh when the token expires within this window. |
 | `LOGIN_TIMEOUT_MS` | 180 s | How long to wait for the browser login. |
 
-One environment variable is honoured:
+Environment variables:
 
 | Variable | Effect |
 |----------|--------|
+| `PI_AWS_SSO_PROFILE=<profile>` | Explicit profile shared by the refresh hook and a custom credential command. Takes precedence over `AWS_PROFILE` and stored provider credentials. |
 | `PI_AWS_SSO_NO_OPEN=1` | Never open a browser automatically; show the code and URL only. |
+
+For a Mantle `apiKey: "!command"` provider, make the command use the same
+contract so the profile checked before the turn is the profile used to mint the
+token:
+
+```bash
+export AWS_PROFILE="${PI_AWS_SSO_PROFILE:-${AWS_PROFILE:-your-sso-profile}}"
+```
 
 ## Development
 

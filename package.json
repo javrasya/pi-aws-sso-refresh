@@ -1,7 +1,7 @@
 {
   "name": "pi-aws-sso-refresh",
   "version": "0.2.0",
-  "description": "Auto-refresh expired AWS SSO sessions for pi's Amazon Bedrock provider",
+  "description": "Auto-refresh AWS SSO sessions for pi's Bedrock and Bedrock Mantle providers",
   "license": "MIT",
   "author": "javrasya",
   "repository": {

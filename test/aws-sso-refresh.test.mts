@@ -11,6 +11,7 @@ const realHome = process.env.HOME;
 process.env.HOME = fixtureHome;
 
 const AWS_ENV_KEYS = [
+  "PI_AWS_SSO_PROFILE",
   "AWS_PROFILE",
   "AWS_CONFIG_FILE",
   "AWS_BEARER_TOKEN_BEDROCK",
@@ -39,6 +40,7 @@ const {
   resolveSsoStartUrl,
   cachedTokenExpiry,
   isBedrockProvider,
+  configuredBedrockProfile,
   resolveBedrockProfile,
   formatRelative,
   isSsoExpiredError,
@@ -170,6 +172,19 @@ describe("cachedTokenExpiry", () => {
 });
 
 describe("resolveBedrockProfile", () => {
+  it("gives the explicit SSO profile override highest precedence", () => {
+    process.env.PI_AWS_SSO_PROFILE = " sso-legacy ";
+    process.env.AWS_PROFILE = "sso-modern";
+    assert.equal(configuredBedrockProfile(), "sso-legacy");
+    assert.equal(resolveBedrockProfile(), "sso-legacy");
+  });
+
+  it("ignores empty overrides", () => {
+    process.env.PI_AWS_SSO_PROFILE = "  ";
+    process.env.AWS_PROFILE = "sso-modern";
+    assert.equal(configuredBedrockProfile(), "sso-modern");
+  });
+
   it("returns the profile when it is SSO-based", () => {
     process.env.AWS_PROFILE = "sso-modern";
     assert.equal(resolveBedrockProfile(), "sso-modern");
@@ -539,6 +554,23 @@ describe("before_agent_start pre-flight", () => {
     }
   });
 
+  it("uses the explicit shared profile for Mantle pre-flight", async () => {
+    process.env.PI_AWS_SSO_PROFILE = "sso-legacy";
+    process.env.AWS_PROFILE = "sso-modern";
+    const h = harness();
+    await h.hook("before_agent_start")(
+      { prompt: "hi" },
+      h.ctx("bedrock-mantle-openai"),
+    );
+    assert.deepEqual(h.spawnArgs[0], [
+      "sso",
+      "login",
+      "--profile",
+      "sso-legacy",
+      "--no-browser",
+    ]);
+  });
+
   it("stays quiet for a healthy token, another provider, or a non-SSO profile", async () => {
     writeSsoCache("healthy", {
       startUrl: START_URL,
@@ -585,6 +617,20 @@ describe("/aws-sso command", () => {
     await h.command("aws-sso")("static-keys", h.ctx("amazon-bedrock"));
     assert.equal(h.spawnArgs.length, 0);
     assert.match(messages(h), /is not SSO-based/);
+  });
+
+  it("uses the explicit shared profile when no argument is supplied", async () => {
+    process.env.PI_AWS_SSO_PROFILE = "sso-legacy";
+    process.env.AWS_PROFILE = "sso-modern";
+    const h = harness();
+    await h.command("aws-sso")("", h.ctx("bedrock-mantle-openai"));
+    assert.deepEqual(h.spawnArgs[0], [
+      "sso",
+      "login",
+      "--profile",
+      "sso-legacy",
+      "--no-browser",
+    ]);
   });
 
   it("uses the active Mantle profile without leaking an unrelated provider profile", async () => {
