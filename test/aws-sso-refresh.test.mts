@@ -38,6 +38,7 @@ const mod = await import("../extensions/aws-sso-refresh.ts");
 const {
   resolveSsoStartUrl,
   cachedTokenExpiry,
+  isBedrockProvider,
   resolveBedrockProfile,
   formatRelative,
   isSsoExpiredError,
@@ -202,6 +203,35 @@ describe("resolveBedrockProfile", () => {
     } finally {
       rmSync(join(fixtureHome, ".pi"), { recursive: true, force: true });
     }
+  });
+
+  it("prefers AWS_PROFILE stored on the active Mantle credential", () => {
+    mkdirSync(join(fixtureHome, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(fixtureHome, ".pi", "agent", "auth.json"),
+      JSON.stringify({
+        "amazon-bedrock": { env: { AWS_PROFILE: "sso-legacy" } },
+        "bedrock-mantle-openai": { env: { AWS_PROFILE: "sso-modern" } },
+      }),
+    );
+    try {
+      assert.equal(resolveBedrockProfile("bedrock-mantle-openai"), "sso-modern");
+      assert.equal(resolveBedrockProfile("bedrock-mantle-anthropic"), "sso-legacy");
+    } finally {
+      rmSync(join(fixtureHome, ".pi"), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Bedrock provider classification", () => {
+  it("includes the built-in and Mantle providers only", () => {
+    assert.equal(isBedrockProvider("amazon-bedrock"), true);
+    assert.equal(isBedrockProvider("bedrock-mantle"), true);
+    assert.equal(isBedrockProvider("bedrock-mantle-openai"), true);
+    assert.equal(isBedrockProvider("bedrock-mantle-anthropic"), true);
+    assert.equal(isBedrockProvider("anthropic"), false);
+    assert.equal(isBedrockProvider("bedrock-mantle-proxy"), false);
+    assert.equal(isBedrockProvider(undefined), false);
   });
 });
 
@@ -396,6 +426,25 @@ describe("extension wiring", () => {
     assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
   });
 
+  it("rewrites expired-SSO errors for Mantle providers", async () => {
+    process.env.AWS_PROFILE = "sso-modern";
+    for (const provider of [
+      "bedrock-mantle",
+      "bedrock-mantle-openai",
+      "bedrock-mantle-anthropic",
+    ]) {
+      const h = harness();
+      const result = (await h.hook("message_end")(
+        assistantError("Token has expired and refresh failed", provider),
+        h.ctx(provider),
+      )) as { message: { errorMessage: string } };
+
+      assert.match(result.message.errorMessage, /^AWS SSO session expired/);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
+    }
+  });
+
   it("leaves unrelated errors and other providers untouched", async () => {
     process.env.AWS_PROFILE = "sso-modern";
     const h = harness();
@@ -477,6 +526,19 @@ describe("before_agent_start pre-flight", () => {
     assert.equal(soon.spawnArgs.length, 1);
   });
 
+  it("pre-flights all Mantle providers", async () => {
+    process.env.AWS_PROFILE = "sso-modern";
+    for (const provider of [
+      "bedrock-mantle",
+      "bedrock-mantle-openai",
+      "bedrock-mantle-anthropic",
+    ]) {
+      const h = harness();
+      await h.hook("before_agent_start")({ prompt: "hi" }, h.ctx(provider));
+      assert.equal(h.spawnArgs.length, 1);
+    }
+  });
+
   it("stays quiet for a healthy token, another provider, or a non-SSO profile", async () => {
     writeSsoCache("healthy", {
       startUrl: START_URL,
@@ -523,6 +585,41 @@ describe("/aws-sso command", () => {
     await h.command("aws-sso")("static-keys", h.ctx("amazon-bedrock"));
     assert.equal(h.spawnArgs.length, 0);
     assert.match(messages(h), /is not SSO-based/);
+  });
+
+  it("uses the active Mantle profile without leaking an unrelated provider profile", async () => {
+    mkdirSync(join(fixtureHome, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(fixtureHome, ".pi", "agent", "auth.json"),
+      JSON.stringify({
+        "amazon-bedrock": { env: { AWS_PROFILE: "sso-legacy" } },
+        anthropic: { env: { AWS_PROFILE: "sso-modern" } },
+        "bedrock-mantle-openai": { env: { AWS_PROFILE: "sso-modern" } },
+      }),
+    );
+    try {
+      const unrelated = harness();
+      await unrelated.command("aws-sso")("", unrelated.ctx("anthropic"));
+      assert.deepEqual(unrelated.spawnArgs[0], [
+        "sso",
+        "login",
+        "--profile",
+        "sso-legacy",
+        "--no-browser",
+      ]);
+
+      const mantle = harness();
+      await mantle.command("aws-sso")("", mantle.ctx("bedrock-mantle-openai"));
+      assert.deepEqual(mantle.spawnArgs[0], [
+        "sso",
+        "login",
+        "--profile",
+        "sso-modern",
+        "--no-browser",
+      ]);
+    } finally {
+      rmSync(join(fixtureHome, ".pi"), { recursive: true, force: true });
+    }
   });
 });
 

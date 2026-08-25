@@ -1,7 +1,7 @@
 # pi-aws-sso-refresh
 
 A [pi](https://pi.dev) package that keeps AWS SSO sessions alive for the
-**Amazon Bedrock** provider.
+**Amazon Bedrock** and **Bedrock Mantle** providers.
 
 ## The problem
 
@@ -29,6 +29,10 @@ no matcher for this one — so there is no recovery path and no prompt.
 | `/aws-sso [profile]` | Manual refresh. |
 
 Refreshing runs `aws sso login --profile <profile>`, which opens your browser.
+
+The extension recognizes pi's built-in `amazon-bedrock` provider and the custom
+`bedrock-mantle`, `bedrock-mantle-openai`, and `bedrock-mantle-anthropic`
+providers.
 
 ## Seeing the device code
 
@@ -108,8 +112,9 @@ pi remove git:github.com/javrasya/pi-aws-sso-refresh
 
 - The AWS CLI v2 (`aws`) on `PATH`.
 - A profile in `~/.aws/config` configured for IAM Identity Center (SSO), selected
-  via `AWS_PROFILE` or stored on the `amazon-bedrock` credential in
-  `~/.pi/agent/auth.json` (`/login amazon-bedrock` → "AWS profile").
+  via `AWS_PROFILE` or stored on the active Bedrock provider's credential in
+  `~/.pi/agent/auth.json`. Mantle providers also fall back to the
+  `amazon-bedrock` credential (`/login amazon-bedrock` → "AWS profile").
 
 ## Configuration
 

@@ -24,7 +24,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const PROVIDER = "amazon-bedrock";
+const BEDROCK_PROVIDERS = new Set([
+  "amazon-bedrock",
+  "bedrock-mantle",
+  "bedrock-mantle-anthropic",
+  "bedrock-mantle-openai",
+]);
 
 /** Refresh when the token expires within this window (clock skew + turn duration). */
 const EXPIRY_SKEW_MS = 5 * 60 * 1000;
@@ -153,25 +158,34 @@ export function cachedTokenExpiry(startUrl: string): number | undefined {
  *
  * Mirrors the precedence in pi-ai's `bedrock-converse-stream`: a bearer token or
  * skip-auth proxy wins, otherwise `AWS_PROFILE` from the process environment or
- * from the env scoped to the stored `amazon-bedrock` credential in auth.json.
+ * from the env scoped to the active Bedrock provider's credential in auth.json.
+ * Custom Mantle providers fall back to the built-in `amazon-bedrock` credential
+ * so an existing `/login amazon-bedrock` setup keeps working.
  */
-export function resolveBedrockProfile(): string | undefined {
+export function isBedrockProvider(provider: string | undefined): boolean {
+  return provider !== undefined && BEDROCK_PROVIDERS.has(provider);
+}
+
+export function resolveBedrockProfile(provider = "amazon-bedrock"): string | undefined {
   if (process.env.AWS_BEARER_TOKEN_BEDROCK) return undefined;
   if (process.env.AWS_BEDROCK_SKIP_AUTH === "1") return undefined;
 
   // No profile at all means static keys or a container/instance role, not SSO.
-  const profile = process.env.AWS_PROFILE ?? storedAuthProfile();
+  const profile = process.env.AWS_PROFILE ?? storedAuthProfile(provider);
   if (!profile) return undefined;
 
   return resolveSsoStartUrl(profile) ? profile : undefined;
 }
 
-function storedAuthProfile(): string | undefined {
+function storedAuthProfile(provider: string): string | undefined {
   try {
     const auth = JSON.parse(
       readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf8"),
     ) as Record<string, { env?: Record<string, string> }>;
-    return auth[PROVIDER]?.env?.AWS_PROFILE;
+    return (
+      auth[provider]?.env?.AWS_PROFILE ??
+      (provider === "amazon-bedrock" ? undefined : auth["amazon-bedrock"]?.env?.AWS_PROFILE)
+    );
   } catch {
     return undefined;
   }
@@ -430,9 +444,10 @@ export default function (pi: ExtensionAPI) {
 
   // 1. Pre-flight, so the request never fails on an expired session.
   pi.on("before_agent_start", async (_event, ctx) => {
-    if (ctx.model?.provider !== PROVIDER) return;
+    const provider = ctx.model?.provider;
+    if (!isBedrockProvider(provider)) return;
 
-    const profile = resolveBedrockProfile();
+    const profile = resolveBedrockProfile(provider);
     if (!profile) return;
 
     const startUrl = resolveSsoStartUrl(profile);
@@ -460,12 +475,17 @@ export default function (pi: ExtensionAPI) {
     const message = event.message;
     if (message.role !== "assistant") return;
     if (message.stopReason !== "error") return;
-    if (message.provider !== PROVIDER && ctx.model?.provider !== PROVIDER) return;
+    const provider = isBedrockProvider(message.provider)
+      ? message.provider
+      : isBedrockProvider(ctx.model?.provider)
+        ? ctx.model?.provider
+        : undefined;
+    if (!provider) return;
 
     const errorMessage = message.errorMessage ?? "";
     if (!isSsoExpiredError(errorMessage)) return;
 
-    const profile = resolveBedrockProfile() ?? process.env.AWS_PROFILE ?? "default";
+    const profile = resolveBedrockProfile(provider) ?? process.env.AWS_PROFILE ?? "default";
 
     // Fire and forget: message finalization must not block on a browser flow.
     void refresh(profile, ctx, {
@@ -490,8 +510,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("aws-sso", {
     description: "Refresh the AWS SSO session used for Amazon Bedrock",
     handler: async (args, ctx) => {
+      const provider = isBedrockProvider(ctx.model?.provider)
+        ? ctx.model?.provider
+        : undefined;
       const profile =
-        args.trim() || resolveBedrockProfile() || process.env.AWS_PROFILE || "default";
+        args.trim() ||
+        resolveBedrockProfile(provider) ||
+        process.env.AWS_PROFILE ||
+        "default";
       const startUrl = resolveSsoStartUrl(profile);
       if (!startUrl) {
         ctx.ui.notify(
