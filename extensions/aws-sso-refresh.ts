@@ -1,11 +1,12 @@
 /**
  * pi-aws-sso-refresh
  *
- * pi's Amazon Bedrock provider authenticates through the AWS SDK default
- * credential chain, so pi holds no credential of its own to refresh. When an SSO
- * session expires, the failure surfaces mid-stream as an opaque provider error
- * ("The SSO session associated with this profile has expired...") with no
- * `/login` affordance, because pi's re-auth prompt only covers OAuth providers.
+ * pi's built-in Amazon Bedrock provider authenticates through the AWS SDK default
+ * credential chain. Custom Bedrock Mantle providers can instead mint a short-lived
+ * bearer token from that same chain. In either case pi holds no renewable AWS SSO
+ * credential of its own. When the SSO session expires, the failure surfaces as an
+ * opaque provider/auth error with no `/login` affordance, because pi's re-auth
+ * prompt only covers OAuth providers.
  *
  * This extension closes that gap:
  *
@@ -24,7 +25,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const PROVIDER = "amazon-bedrock";
+const BEDROCK_PROVIDERS = new Set([
+  "amazon-bedrock",
+  "bedrock-mantle",
+  "bedrock-mantle-anthropic",
+  "bedrock-mantle-openai",
+]);
 
 /** Refresh when the token expires within this window (clock skew + turn duration). */
 const EXPIRY_SKEW_MS = 5 * 60 * 1000;
@@ -151,27 +157,55 @@ export function cachedTokenExpiry(startUrl: string): number | undefined {
  * The profile pi will actually use for Bedrock, or undefined when this setup is
  * not SSO-based and we should stay out of the way.
  *
- * Mirrors the precedence in pi-ai's `bedrock-converse-stream`: a bearer token or
- * skip-auth proxy wins, otherwise `AWS_PROFILE` from the process environment or
- * from the env scoped to the stored `amazon-bedrock` credential in auth.json.
+ * `PI_AWS_SSO_PROFILE` is an explicit contract between this pre-flight hook and
+ * custom credential commands (for example, a Mantle bearer-token minter). It wins
+ * over ambient `AWS_PROFILE`, which in turn wins over the profile scoped to the
+ * active provider's credential in auth.json. Custom Mantle providers fall back to
+ * the built-in `amazon-bedrock` credential so an existing `/login amazon-bedrock`
+ * setup keeps working.
  */
-export function resolveBedrockProfile(): string | undefined {
+export function isBedrockProvider(provider: string | undefined): boolean {
+  return provider !== undefined && BEDROCK_PROVIDERS.has(provider);
+}
+
+export function configuredBedrockProfile(
+  provider = "amazon-bedrock",
+): string | undefined {
+  return firstNonEmpty(
+    process.env.PI_AWS_SSO_PROFILE,
+    process.env.AWS_PROFILE,
+    storedAuthProfile(provider),
+  );
+}
+
+export function resolveBedrockProfile(provider = "amazon-bedrock"): string | undefined {
   if (process.env.AWS_BEARER_TOKEN_BEDROCK) return undefined;
   if (process.env.AWS_BEDROCK_SKIP_AUTH === "1") return undefined;
 
   // No profile at all means static keys or a container/instance role, not SSO.
-  const profile = process.env.AWS_PROFILE ?? storedAuthProfile();
+  const profile = configuredBedrockProfile(provider);
   if (!profile) return undefined;
 
   return resolveSsoStartUrl(profile) ? profile : undefined;
 }
 
-function storedAuthProfile(): string | undefined {
+function firstNonEmpty(...values: (string | undefined)[]): string | undefined {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+function storedAuthProfile(provider: string): string | undefined {
   try {
     const auth = JSON.parse(
       readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf8"),
     ) as Record<string, { env?: Record<string, string> }>;
-    return auth[PROVIDER]?.env?.AWS_PROFILE;
+    return (
+      auth[provider]?.env?.AWS_PROFILE ??
+      (provider === "amazon-bedrock" ? undefined : auth["amazon-bedrock"]?.env?.AWS_PROFILE)
+    );
   } catch {
     return undefined;
   }
@@ -430,9 +464,10 @@ export default function (pi: ExtensionAPI) {
 
   // 1. Pre-flight, so the request never fails on an expired session.
   pi.on("before_agent_start", async (_event, ctx) => {
-    if (ctx.model?.provider !== PROVIDER) return;
+    const provider = ctx.model?.provider;
+    if (!isBedrockProvider(provider)) return;
 
-    const profile = resolveBedrockProfile();
+    const profile = resolveBedrockProfile(provider);
     if (!profile) return;
 
     const startUrl = resolveSsoStartUrl(profile);
@@ -460,12 +495,18 @@ export default function (pi: ExtensionAPI) {
     const message = event.message;
     if (message.role !== "assistant") return;
     if (message.stopReason !== "error") return;
-    if (message.provider !== PROVIDER && ctx.model?.provider !== PROVIDER) return;
+    const provider = isBedrockProvider(message.provider)
+      ? message.provider
+      : isBedrockProvider(ctx.model?.provider)
+        ? ctx.model?.provider
+        : undefined;
+    if (!provider) return;
 
     const errorMessage = message.errorMessage ?? "";
     if (!isSsoExpiredError(errorMessage)) return;
 
-    const profile = resolveBedrockProfile() ?? process.env.AWS_PROFILE ?? "default";
+    const profile =
+      resolveBedrockProfile(provider) ?? configuredBedrockProfile(provider) ?? "default";
 
     // Fire and forget: message finalization must not block on a browser flow.
     void refresh(profile, ctx, {
@@ -490,8 +531,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("aws-sso", {
     description: "Refresh the AWS SSO session used for Amazon Bedrock",
     handler: async (args, ctx) => {
+      const provider = isBedrockProvider(ctx.model?.provider)
+        ? ctx.model?.provider
+        : undefined;
       const profile =
-        args.trim() || resolveBedrockProfile() || process.env.AWS_PROFILE || "default";
+        args.trim() ||
+        resolveBedrockProfile(provider) ||
+        configuredBedrockProfile(provider) ||
+        "default";
       const startUrl = resolveSsoStartUrl(profile);
       if (!startUrl) {
         ctx.ui.notify(
