@@ -42,10 +42,11 @@ const LOGIN_TIMEOUT_MS = 180_000;
 const DEVICE_CODE_PATTERN = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
 
 /** The autofill form of the portal URL carries the code as a query param. */
-const AUTOFILL_URL_PATTERN = /(https?:\/\/\S*[?&]user_code=[A-Z0-9]{4}-[A-Z0-9]{4})/;
-const ANY_URL_PATTERN = /(https?:\/\/\S+)/;
+const AUTOFILL_URL_PATTERN = /(https?:\/\/\S*[?&]user_code=[A-Z0-9]{4}-[A-Z0-9]{4})(?=\s)/;
+// A streamed chunk may end halfway through a URL; wait for a delimiter.
+const ANY_URL_PATTERN = /(https?:\/\/\S+)(?=\s)/;
 
-/** Older AWS CLI builds predate `--no-browser`. */
+/** Older AWS CLI builds may predate either login flag. */
 const UNSUPPORTED_FLAG_PATTERN =
   /(?:unknown option|unrecognized argument|invalid choice|argument (?:operation|subcommand))/i;
 
@@ -225,18 +226,25 @@ export function isSsoExpiredError(message: string): boolean {
 // ------------------------------------------------------- login subprocess
 
 /**
- * The device code and portal URL from `aws sso login --no-browser` output.
- *
- * The browser's authorization page asks the user to confirm that the code shown
- * there matches "the one given to you" — so the code has to reach the user
- * *before* the login completes, which is why the login is streamed rather than
- * run through `pi.exec` (which buffers until exit).
+ * The authorization URL and optional device code from `aws sso login` output.
+ * PKCE prints an authorization URL only; device authorization also prints a code.
+ * Stream both forms before the child exits so the user can complete the login.
  */
 export function parseSsoPrompt(output: string): { code?: string; url?: string } {
-  const code = output.match(DEVICE_CODE_PATTERN)?.[1];
+  // OAuth state/client parameters can contain code-like strings, but are not
+  // device codes. Only look for a code outside URLs.
+  const code = output.replace(/https?:\/\/\S+/g, "").match(DEVICE_CODE_PATTERN)?.[1];
   // Prefer the autofill URL: it carries the code, so the user does not retype it.
   const url = output.match(AUTOFILL_URL_PATTERN)?.[1] ?? output.match(ANY_URL_PATTERN)?.[1];
   return { ...(code !== undefined && { code }), ...(url !== undefined && { url }) };
+}
+
+function isPkceUrl(url: string): boolean {
+  try {
+    return new URL(url).searchParams.get("response_type") === "code";
+  } catch {
+    return false;
+  }
 }
 
 type ChunkStream = { on(event: "data", listener: (chunk: unknown) => void): unknown } | null;
@@ -284,15 +292,16 @@ function tenantOf(startUrl: string | undefined): string | undefined {
 }
 
 /**
- * Keeps the device code on screen for the whole login, next to the profile and
- * tenant it belongs to, so the user can match it against the browser's
- * "Confirm this code matches the one given to you" page and cancel if it differs.
+ * Keeps the login URL and optional device code on screen for the whole login.
+ * Device authorization requires matching the code against the browser; PKCE
+ * requires completing authorization in a browser on the same device.
  */
 function renderLoginWidget(
   ctx: ExtensionContext,
   profile: string,
   tenant: string | undefined,
   code: string | undefined,
+  url?: string,
 ): void {
   const accent = (text: string) => ctx.ui.theme?.fg?.("accent", text) ?? text;
   const dim = (text: string) => ctx.ui.theme?.fg?.("dim", text) ?? text;
@@ -301,9 +310,12 @@ function renderLoginWidget(
     accent("AWS SSO login"),
     dim(`  profile   ${profile}${tenant ? `   tenant   ${tenant}` : ""}`),
     code === undefined
-      ? dim("  requesting device code...")
+      ? dim(url
+          ? "  complete authorization in your browser on this device"
+          : "  requesting authorization...")
       : `  code      ${accent(code)}`,
   ];
+  if (url) lines.push(`  URL       ${url}`);
   if (code !== undefined) {
     lines.push(dim("  this must match the code shown in your browser — cancel there if not"));
   }
@@ -318,18 +330,27 @@ export default function (pi: ExtensionAPI) {
   /** Profiles the user declined this session; do not nag again. */
   const declined = new Set<string>();
 
-  async function runLogin(profile: string, ctx: ExtensionContext): Promise<boolean> {
+  async function runLogin(
+    profile: string,
+    ctx: ExtensionContext,
+    useDeviceCode = false,
+  ): Promise<boolean> {
     const tenant = tenantOf(resolveSsoStartUrl(profile));
 
-    // --no-browser makes the CLI print the code and URL instead of racing ahead
-    // to the browser, so we can show the code first and open the URL after.
-    const attempt = await streamLogin(profile, tenant, ctx, true);
-    if (attempt.unsupportedFlag) {
-      // Older CLI: let it open the browser itself. The code is still streamed,
-      // just possibly after the browser is already up.
-      return (await streamLogin(profile, tenant, ctx, false)).ok;
+    // Let the CLI choose its default flow (PKCE for modern sso-session profiles,
+    // device authorization for legacy profiles), unless explicitly overridden.
+    let noBrowser = true;
+    for (;;) {
+      const attempt = await streamLogin(profile, tenant, ctx, noBrowser, useDeviceCode);
+      if (attempt.unsupportedFlag === "use-device-code") {
+        // Older CLIs already use device authorization by default.
+        useDeviceCode = false;
+      } else if (attempt.unsupportedFlag === "no-browser") {
+        noBrowser = false;
+      } else {
+        return attempt.ok;
+      }
     }
-    return attempt.ok;
   }
 
   async function streamLogin(
@@ -337,15 +358,19 @@ export default function (pi: ExtensionAPI) {
     tenant: string | undefined,
     ctx: ExtensionContext,
     noBrowser: boolean,
-  ): Promise<{ ok: boolean; unsupportedFlag?: boolean }> {
+    useDeviceCode: boolean,
+  ): Promise<{ ok: boolean; unsupportedFlag?: "no-browser" | "use-device-code" }> {
     const args = ["sso", "login", "--profile", profile];
     if (noBrowser) args.push("--no-browser");
+    if (useDeviceCode) args.push("--use-device-code");
 
     ctx.ui.setStatus("aws-sso", `aws sso login (${profile})...`);
     renderLoginWidget(ctx, profile, tenant, undefined);
 
     let output = "";
     let shownCode: string | undefined;
+    let shownUrl: string | undefined;
+    let openedUrl = false;
 
     const result = await new Promise<{ code: number | null; spawnError?: Error }>((resolve) => {
       let child: SpawnedChild;
@@ -372,21 +397,37 @@ export default function (pi: ExtensionAPI) {
       (timer as unknown as { unref?: () => void }).unref?.();
 
       const onChunk = (chunk: unknown) => {
+        if (settled) return;
         output += String(chunk);
         const { code, url } = parseSsoPrompt(output);
-        if (code === undefined || code === shownCode) return;
-
-        // Surface the code the moment it appears. This is the whole point: the
-        // browser asks the user to confirm it matches "the one given to you".
-        shownCode = code;
-        renderLoginWidget(ctx, profile, tenant, code);
-        ctx.ui.setStatus("aws-sso", `aws sso ${code}`);
-        ctx.ui.notify(
-          `AWS SSO code ${code} for profile "${profile}"${tenant ? ` (${tenant})` : ""}. ` +
-            `Confirm it matches the code in your browser; cancel there if it does not.`,
-          "warning",
-        );
-        if (noBrowser && url) deps.openUrl(url);
+        if (code !== undefined && code !== shownCode) {
+          shownCode = code;
+          ctx.ui.setStatus("aws-sso", `aws sso ${code}`);
+          ctx.ui.notify(
+            `AWS SSO code ${code} for profile "${profile}"${tenant ? ` (${tenant})` : ""}. ` +
+              `Confirm it matches the code in your browser; cancel there if it does not.`,
+            "warning",
+          );
+        }
+        // PKCE has no device code. For device login, wait until the code has
+        // been displayed before opening the portal. Handle URL and code arriving
+        // in separate chunks without duplicate notifications or browser tabs.
+        if (url && url !== shownUrl && (shownCode || isPkceUrl(url))) {
+          shownUrl = url;
+          ctx.ui.notify(
+            `AWS SSO login URL for profile "${profile}": ${url}` +
+              (shownCode ? "" :
+                "\nComplete authorization in your browser on this device (PKCE; no device code)."),
+            "info",
+          );
+        }
+        if (shownCode || shownUrl) {
+          renderLoginWidget(ctx, profile, tenant, shownCode, shownUrl);
+        }
+        if (shownUrl && noBrowser && !openedUrl && process.env.PI_AWS_SSO_NO_OPEN !== "1") {
+          openedUrl = true;
+          deps.openUrl(shownUrl);
+        }
       };
 
       child.stdout?.on("data", onChunk);
@@ -411,8 +452,13 @@ export default function (pi: ExtensionAPI) {
       return { ok: true };
     }
 
-    if (noBrowser && UNSUPPORTED_FLAG_PATTERN.test(output) && output.includes("no-browser")) {
-      return { ok: false, unsupportedFlag: true };
+    if (UNSUPPORTED_FLAG_PATTERN.test(output)) {
+      if (useDeviceCode && output.includes("use-device-code")) {
+        return { ok: false, unsupportedFlag: "use-device-code" };
+      }
+      if (noBrowser && output.includes("no-browser") && process.env.PI_AWS_SSO_NO_OPEN !== "1") {
+        return { ok: false, unsupportedFlag: "no-browser" };
+      }
     }
 
     const detail = output.trim().split("\n").slice(-3).join(" ");
@@ -427,7 +473,7 @@ export default function (pi: ExtensionAPI) {
   async function refresh(
     profile: string,
     ctx: ExtensionContext,
-    opts: { ask: boolean; reason: string },
+    opts: { ask: boolean; reason: string; useDeviceCode?: boolean },
   ): Promise<boolean> {
     // Single-flight the whole sequence, prompt included. Guarding only the exec
     // would let concurrent turns each open their own confirm dialog and then
@@ -454,7 +500,7 @@ export default function (pi: ExtensionAPI) {
           return false;
         }
       }
-      return runLogin(profile, ctx);
+      return runLogin(profile, ctx, opts.useDeviceCode);
     })().finally(() => {
       inFlight = undefined;
     });
@@ -527,15 +573,22 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // 3. Manual escape hatch: /aws-sso [profile]
+  // 3. Manual escape hatch: /aws-sso [profile] [--use-device-code]
   pi.registerCommand("aws-sso", {
-    description: "Refresh the AWS SSO session used for Amazon Bedrock",
+    description: "Refresh AWS SSO: [profile] [--use-device-code]",
     handler: async (args, ctx) => {
+      const words = args.trim().split(/\s+/).filter(Boolean);
+      const useDeviceCode = words.includes("--use-device-code");
+      const profiles = words.filter((word) => word !== "--use-device-code");
+      if (profiles.length > 1 || profiles.some((word) => word.startsWith("--"))) {
+        ctx.ui.notify("Usage: /aws-sso [profile] [--use-device-code]", "warning");
+        return;
+      }
       const provider = isBedrockProvider(ctx.model?.provider)
         ? ctx.model?.provider
         : undefined;
       const profile =
-        args.trim() ||
+        profiles[0] ||
         resolveBedrockProfile(provider) ||
         configuredBedrockProfile(provider) ||
         "default";
@@ -554,7 +607,7 @@ export default function (pi: ExtensionAPI) {
           : `Token for "${profile}" expires ${formatRelative(expiry)}. Refreshing...`,
         "info",
       );
-      await refresh(profile, ctx, { ask: false, reason: "" });
+      await refresh(profile, ctx, { ask: false, reason: "", useDeviceCode });
     },
   });
 

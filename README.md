@@ -26,7 +26,7 @@ no matcher for this one — so there is no recovery path and no prompt.
 |------|-----------|
 | `before_agent_start` | Pre-flight: reads the local SSO token cache and refreshes *before* the request is built, so the turn never fails. |
 | `message_end` | Fallback for sessions that expire mid-turn: rewrites the opaque SDK error into an actionable one and offers to re-login. |
-| `/aws-sso [profile]` | Manual refresh. |
+| `/aws-sso [profile] [--use-device-code]` | Manual refresh; optionally request device authorization instead of PKCE. |
 
 Refreshing runs `aws sso login --profile <profile>`, which opens your browser.
 
@@ -40,7 +40,29 @@ provider in `models.json` using pi's existing `openai-responses` or
 `anthropic-messages` API, or install a separate Mantle provider package. This
 package only keeps the AWS SSO credentials used by that provider healthy.
 
-## Seeing the device code
+## Browser login: PKCE and device authorization
+
+The extension supports both AWS CLI login flows without changing `~/.aws/config`:
+
+- **PKCE** is the default for modern `sso_session` profiles on AWS CLI v2.22.0+.
+  The CLI prints an authorization URL, **not a device code**. The extension
+  displays that URL in the login widget and a notification, then opens it.
+  Complete authorization in a browser on the **same device** running pi, because
+  the CLI receives the callback through a local HTTP server.
+- **Device authorization** is used by legacy profiles and older CLIs. The
+  extension displays the device code before opening the login URL, as described
+  below. You can also request this flow explicitly with a modern profile:
+
+  ```text
+  /aws-sso --use-device-code
+  /aws-sso ai-dev --use-device-code
+  ```
+
+Without `--use-device-code`, both manual and automatic refreshes use the CLI's
+normal default. On an older CLI that does not recognize `--use-device-code`, the
+extension retries without it (these versions already default to device login).
+
+### Seeing the device code
 
 AWS's authorization page asks you to confirm the code shown there matches *"the
 one given to you"*:
@@ -69,11 +91,18 @@ alongside it, so you can confirm *which* login is being requested, not just that
 some login is. If the codes differ, cancel in the browser — someone else's device
 authorization is in flight.
 
-pi passes `--no-browser` so the CLI prints the code *instead of* racing ahead to
-the browser; the extension then opens the autofill URL itself, so you still don't
-have to type the code. On an AWS CLI too old for `--no-browser`, it retries with
-the browser-opening form and streams the code as soon as it appears. Set
-`PI_AWS_SSO_NO_OPEN=1` to never open a browser automatically.
+pi passes `--no-browser` so the CLI prints the authorization prompt instead of
+racing ahead to the browser. For PKCE, the extension opens the authorization URL
+without waiting for a nonexistent device code. For device login, it shows the
+code first and opens the autofill URL when available, so you need not retype it.
+The URL stays visible if browser opening fails or is disabled. Streamed URL
+fragments are buffered until complete, and each login opens at most one tab.
+
+On an AWS CLI too old for `--no-browser`, it retries with the browser-opening
+form and still streams the prompt. Set `PI_AWS_SSO_NO_OPEN=1` to never open a
+browser automatically; the URL and any device code are still displayed. With
+this setting, an old CLI without `--no-browser` fails rather than opening a
+browser through the fallback.
 
 Design notes:
 
@@ -156,10 +185,12 @@ npm run typecheck
 ```
 
 The tests point `$HOME` at a temporary fixture directory, so they never read your
-real `~/.aws` and never shell out to `aws`. The device-code tests assert against
-verbatim `aws-cli/2.34.38` output and check what was on screen *while the login
-was still running*, since "the code was displayed eventually" is not the property
-that matters.
+real `~/.aws` and never shell out to `aws`. They cover URL-only PKCE prompts,
+device codes, fragmented output, older CLI fallbacks, and disabled browser
+opening. The device-code fixture uses verbatim `aws-cli/2.34.38` output; the PKCE
+fixture uses the modern CLI's URL-only format with synthetic OAuth parameters.
+Both flows check what was on screen *while the login was still running*, since
+"the prompt was displayed eventually" is not the property that matters.
 
 ## License
 
