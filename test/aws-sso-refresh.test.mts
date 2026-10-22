@@ -11,6 +11,7 @@ const realHome = process.env.HOME;
 process.env.HOME = fixtureHome;
 
 const AWS_ENV_KEYS = [
+  "PI_AWS_SSO_NO_OPEN",
   "PI_AWS_SSO_PROFILE",
   "AWS_PROFILE",
   "AWS_CONFIG_FILE",
@@ -65,6 +66,15 @@ CLJH-CFGF
 
 Alternatively, you may visit the following URL which will autofill the code upon loading:
 https://d-c3671a531d.awsapps.com/start/#/device?user_code=CLJH-CFGF
+`;
+
+// Representative modern CLI output: PKCE prints only a URL. Deliberately
+// include a code-shaped OAuth state to catch accidental device-code detection.
+const PKCE_URL = "https://oidc.eu-west-1.amazonaws.com/authorize?response_type=code&client_id=example&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Foauth%2Fcallback&state=ABCD-1234&code_challenge=example&code_challenge_method=S256";
+const PKCE_CLI_OUTPUT = `Browser will not be automatically opened.
+Please visit the following URL:
+
+${PKCE_URL}
 `;
 
 before(() => {
@@ -612,6 +622,26 @@ describe("/aws-sso command", () => {
     assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
   });
 
+  it("accepts an explicit device-code request with or without a profile", async () => {
+    process.env.AWS_PROFILE = "sso-modern";
+    for (const args of ["sso-modern --use-device-code", "--use-device-code sso-modern", "--use-device-code"]) {
+      const h = harness();
+      await h.command("aws-sso")(args, h.ctx("amazon-bedrock"));
+      assert.deepEqual(h.spawnArgs[0], [
+        "sso", "login", "--profile", "sso-modern", "--no-browser", "--use-device-code",
+      ]);
+    }
+  });
+
+  it("rejects unknown options and extra profiles without spawning", async () => {
+    for (const args of ["--unknown", "sso-modern sso-legacy"]) {
+      const h = harness();
+      await h.command("aws-sso")(args, h.ctx("amazon-bedrock"));
+      assert.equal(h.spawnArgs.length, 0);
+      assert.match(messages(h), /Usage: \/aws-sso/);
+    }
+  });
+
   it("refuses a non-SSO profile", async () => {
     const h = harness();
     await h.command("aws-sso")("static-keys", h.ctx("amazon-bedrock"));
@@ -677,6 +707,15 @@ describe("parseSsoPrompt", () => {
     });
   });
 
+  it("extracts a PKCE URL without treating OAuth state as a device code", () => {
+    assert.deepEqual(parseSsoPrompt(PKCE_CLI_OUTPUT), { url: PKCE_URL });
+  });
+
+  it("waits for a complete URL instead of returning a chunk-boundary prefix", () => {
+    assert.deepEqual(parseSsoPrompt(`Please visit:\n${PKCE_URL.slice(0, 80)}`), {});
+    assert.deepEqual(parseSsoPrompt(PKCE_CLI_OUTPUT), { url: PKCE_URL });
+  });
+
   it("handles a chunk that arrives before the code is printed", () => {
     const partial = "Browser will not be automatically opened.\nPlease visit the following URL:\n";
     assert.deepEqual(parseSsoPrompt(partial), {});
@@ -692,6 +731,60 @@ describe("parseSsoPrompt", () => {
 
   it("does not mistake lowercase host fragments for a code", () => {
     assert.equal(parseSsoPrompt("https://d-c3671a531d.awsapps.com/start").code, undefined);
+  });
+});
+
+describe("PKCE login", () => {
+  beforeEach(clearSsoCache);
+
+  it("opens and displays the authorization URL while login is still running, without a code", async () => {
+    const h = harness();
+    h.script({ chunks: [PKCE_CLI_OUTPUT, "Waiting for authorization...\n"], code: 0 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [PKCE_URL]);
+    assert.deepEqual(h.spawnArgs[0], ["sso", "login", "--profile", "sso-modern", "--no-browser"]);
+    const during = h.duringLogin();
+    assert.ok(during.widgets.some((lines) => lines?.some((line) => line.includes(PKCE_URL))));
+    assert.ok(during.notices.some((notice) => notice.includes(PKCE_URL)));
+    assert.ok(during.notices.some((notice) => notice.includes("PKCE; no device code")));
+    assert.doesNotMatch(messages(h), /AWS SSO code|Confirm it matches/);
+    assert.ok(h.widgets.every((lines) => !lines?.some((line) => line.includes("requesting device code"))));
+    assert.equal(h.widgets.at(-1), undefined);
+    assert.equal(h.statuses.at(-1), undefined);
+  });
+
+  it("waits for a fragmented URL to finish and opens it only once", async () => {
+    const h = harness();
+    h.script({ chunks: [...PKCE_CLI_OUTPUT], code: 0 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [PKCE_URL]);
+    assert.equal(h.notices.filter((n) => n.message.includes(PKCE_URL)).length, 1);
+  });
+
+  it("handles PKCE output on stderr", async () => {
+    const h = harness();
+    h.script({ stderrChunks: [PKCE_CLI_OUTPUT], code: 0 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [PKCE_URL]);
+  });
+
+  it("also works for automatic pre-flight refreshes", async () => {
+    process.env.AWS_PROFILE = "sso-modern";
+    const h = harness();
+    h.script({ chunks: [PKCE_CLI_OUTPUT], code: 0 });
+    await h.hook("before_agent_start")({ prompt: "hi" }, h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [PKCE_URL]);
+  });
+
+  it("does not open a second tab when an old CLI opens the PKCE URL itself", async () => {
+    const h = harness();
+    h.script([
+      { stderrChunks: ["Unknown options: --no-browser\n"], code: 2 },
+      { chunks: [PKCE_CLI_OUTPUT], code: 0 },
+    ]);
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, []);
+    assert.ok(h.duringLogin().notices.some((notice) => notice.includes(PKCE_URL)));
   });
 });
 
@@ -759,6 +852,28 @@ describe("device code visibility", () => {
     assert.equal(h.notices.filter((n) => n.message.includes("CLJH-CFGF")).length, 1);
   });
 
+  it("opens the URL even when it arrives after the device code", async () => {
+    const h = harness();
+    const url = "https://example.awsapps.com/start/#/device?user_code=CLJH-CFGF";
+    h.script({ chunks: ["Then enter the code:\n\nCLJH-CFGF\n", `${url}\n`, "waiting\n"], code: 0 });
+    await h.command("aws-sso")("sso-legacy", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [url]);
+    assert.equal(h.notices.filter((n) => n.level === "warning" && n.message.includes("CLJH-CFGF")).length, 1);
+  });
+
+  it("waits to show the device code before opening an earlier portal URL", async () => {
+    const h = harness();
+    const url = "https://example.awsapps.com/start/#/device";
+    h.script({ chunks: [`${url}\n`, "Then enter the code:\n\nCLJH-CFGF\n"], code: 0 });
+    deps.openUrl = (opened) => {
+      assert.ok(h.notices.some((n) => n.level === "warning" && n.message.includes("CLJH-CFGF")));
+      assert.ok(h.widgets.some((lines) => lines?.some((line) => line.includes("CLJH-CFGF"))));
+      h.openedUrls.push(opened);
+    };
+    await h.command("aws-sso")("sso-legacy", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.openedUrls, [url]);
+  });
+
   it("falls back to the browser-opening form on an AWS CLI without --no-browser", async () => {
     const h = harness();
     h.script([
@@ -776,6 +891,72 @@ describe("device code visibility", () => {
     assert.match(messages(h), /refreshed for profile "sso-modern"/);
     // The unsupported-flag probe must not be reported as a real failure.
     assert.doesNotMatch(messages(h), /Unknown options/);
+  });
+
+  it("keeps an explicit device-code request when retrying without --no-browser", async () => {
+    const h = harness();
+    h.script([
+      { stderrChunks: ["Unknown options: --no-browser\n"], code: 2 },
+      { chunks: [REAL_CLI_OUTPUT], code: 0 },
+    ]);
+    await h.command("aws-sso")("sso-modern --use-device-code", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.spawnArgs, [
+      ["sso", "login", "--profile", "sso-modern", "--no-browser", "--use-device-code"],
+      ["sso", "login", "--profile", "sso-modern", "--use-device-code"],
+    ]);
+    assert.deepEqual(h.openedUrls, []);
+  });
+
+  it("retries an explicit device-code login on a CLI predating --use-device-code", async () => {
+    const h = harness();
+    h.script([
+      { stderrChunks: ["Unknown options: --use-device-code\n"], code: 2 },
+      { chunks: [REAL_CLI_OUTPUT], code: 0 },
+    ]);
+    await h.command("aws-sso")("sso-modern --use-device-code", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.spawnArgs, [
+      ["sso", "login", "--profile", "sso-modern", "--no-browser", "--use-device-code"],
+      ["sso", "login", "--profile", "sso-modern", "--no-browser"],
+    ]);
+    assert.equal(h.openedUrls.length, 1);
+    assert.doesNotMatch(messages(h), /Unknown options/);
+  });
+
+  it("removes both unsupported flags with bounded retries", async () => {
+    const h = harness();
+    h.script([
+      { stderrChunks: ["Unknown options: --no-browser, --use-device-code\n"], code: 2 },
+      { stderrChunks: ["Unknown options: --no-browser\n"], code: 2 },
+      { chunks: [REAL_CLI_OUTPUT], code: 0 },
+    ]);
+    await h.command("aws-sso")("sso-modern --use-device-code", h.ctx("amazon-bedrock"));
+    assert.deepEqual(h.spawnArgs, [
+      ["sso", "login", "--profile", "sso-modern", "--no-browser", "--use-device-code"],
+      ["sso", "login", "--profile", "sso-modern", "--no-browser"],
+      ["sso", "login", "--profile", "sso-modern"],
+    ]);
+    assert.deepEqual(h.openedUrls, []);
+    assert.match(messages(h), /refreshed for profile/);
+  });
+
+  it("honours no-open for both flows while keeping the login URL visible", async () => {
+    process.env.PI_AWS_SSO_NO_OPEN = "1";
+    for (const output of [PKCE_CLI_OUTPUT, REAL_CLI_OUTPUT]) {
+      const h = harness();
+      h.script({ chunks: [output], code: 0 });
+      await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+      assert.deepEqual(h.openedUrls, []);
+      assert.ok(h.duringLogin().notices.some((n) => n.includes("AWS SSO login URL")));
+    }
+  });
+
+  it("does not fall back to CLI browser opening when no-open is set", async () => {
+    process.env.PI_AWS_SSO_NO_OPEN = "1";
+    const h = harness();
+    h.script({ stderrChunks: ["Unknown options: --no-browser\n"], code: 2 });
+    await h.command("aws-sso")("sso-modern", h.ctx("amazon-bedrock"));
+    assert.equal(h.spawnArgs.length, 1);
+    assert.match(messages(h), /failed \(exit 2\)/);
   });
 
   it("reports a missing aws CLI instead of hanging", async () => {
